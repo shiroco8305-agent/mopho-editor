@@ -129,6 +129,8 @@ canvas.env{width:100%;height:70px;display:block;background:#0e0f10;border:1px so
 #lib .empty{display:block;color:#8b8d93;cursor:default;font-family:inherit}
 .hint{color:var(--dim);font-size:11px;margin-top:6px;line-height:1.5}
 .hint kbd{background:var(--panel2);border:1px solid var(--line);border-radius:3px;padding:0 4px;font-size:10px}
+#mon{height:200px;overflow:auto;background:#141517;color:#dcdcdc;font:11px/1.5 Menlo,monospace;border:1px solid #000;border-radius:6px;padding:4px 8px;margin-top:4px}
+#mon .k{color:#ffc48a}#mon .m{color:#7fc8ff}#mon .x{color:#ff7a7a}#mon .t{color:#6b6d73}
 #gl{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#000;border:1px solid var(--accent);
   color:#eee;padding:8px 16px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;max-width:90vw}
@@ -199,6 +201,10 @@ body.drop::after{content:"Drop .syx file";position:fixed;inset:0;background:rgba
     <button id="btnReqBank">Request Bank</button><button id="btnSaveLib">Save Lib .syx</button><button id="btnSendLib" class="danger">Write All</button><button id="btnClrLib">Clear</button></span></h2>
     <div class="hint" id="libInfo"></div>
     <div id="lib"></div>
+  </div>
+  <div class="panel w2"><h2>MIDI Monitor <span class="right"><label style="font-size:10px;display:flex;align-items:center;gap:4px;text-transform:none;letter-spacing:0;color:#1c1606"><input type="checkbox" id="monNrpn"> NRPN 표시</label><button id="monClr">Clear</button></span></h2>
+    <div id="mon"></div>
+    <div class="hint"><span style="color:#b8380a">■</span> <b>Keys</b>(건반 입력) — "→ Mopho"는 전달됨, "차단"은 Thru 필터가 막은 것 · <b>Mopho</b>(Mopho In에서 온 메시지). MIDI 클럭/Active Sensing은 생략.</div>
   </div>
   <div class="panel w2"><h2>Global <span class="right"><button id="btnReqGlobal">Request</button></span></h2>
     <div id="gl"></div>
@@ -411,15 +417,40 @@ function pickPorts(){
 }
 function send(bytes){if(!out)return false;try{out.send(bytes);blink('ledOut');return true;}catch(e){toast('MIDI 전송 실패: '+e.message);return false;}}
 
+// MIDI monitor: shows what actually arrives on Keys / Mopho In (to debug controllers that "do nothing")
+const CC_NAME={0:'Bank MSB',1:'Mod Wheel',2:'Breath',4:'Foot',6:'Data MSB',7:'Volume',11:'Expression',32:'Bank LSB',38:'Data LSB',64:'Sustain',74:'Brightness',98:'NRPN LSB',99:'NRPN MSB',120:'All Sound Off',121:'Reset Ctrl',123:'All Notes Off'};
+const monLines=[];let monQueued=false;
+function monLog(src,d,fwd){
+  if(d[0]===0xF8||d[0]===0xFE)return;
+  const st=d[0]&0xF0,ch=(d[0]&0x0F)+1;
+  if(st===0xB0&&[98,99,6,38].includes(d[1])&&!$('monNrpn').checked)return;
+  let t;
+  if(d[0]===0xF0)t=`SysEx ${d.length} bytes`+(d[1]===DSI&&d[2]===MOPHO?' (Mopho cmd '+d[3].toString(16).padStart(2,'0')+')':'');
+  else if(st===0x90&&d[2]>0)t=`ch${ch} Note On  ${NOTE[d[1]%12]}${Math.floor(d[1]/12)-1} vel ${d[2]}`;
+  else if(st===0x80||st===0x90)t=`ch${ch} Note Off ${NOTE[d[1]%12]}${Math.floor(d[1]/12)-1}`;
+  else if(st===0xB0)t=`ch${ch} CC${d[1]}${CC_NAME[d[1]]?' ('+CC_NAME[d[1]]+')':''} = ${d[2]}`;
+  else if(st===0xC0)t=`ch${ch} Program Change ${d[1]+1}`;
+  else if(st===0xD0)t=`ch${ch} Pressure ${d[1]}`;
+  else if(st===0xE0)t=`ch${ch} Pitch Bend ${((d[2]<<7)|d[1])-8192}`;
+  else if(st===0xA0)t=`ch${ch} Poly AT ${d[1]} = ${d[2]}`;
+  else t=Array.from(d).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+  const tag=src==='Keys'?(fwd?'<span class="k">→ Mopho</span>':'<span class="x">차단</span>'):'';
+  const now=new Date(),ts=now.toTimeString().slice(0,8)+'.'+String(now.getMilliseconds()).padStart(3,'0');
+  monLines.unshift(`<span class="t">${ts}</span> <span class="${src==='Keys'?'k':'m'}">${src.padEnd(5)}</span> ${t} ${tag}`);
+  if(monLines.length>80)monLines.length=80;
+  if(!monQueued){monQueued=true;setTimeout(()=>{monQueued=false;$('mon').innerHTML=monLines.join('<br>');},50);}
+}
+
 // MIDI Thru: master keyboard → Mopho, re-channelled to the editor channel.
 // Only performance messages pass; program changes, sysex, clock and the keyboard's own knob CCs are dropped
 // so they can't change Mopho programs/parameters.
 let keysIn=null;const thruHeld=new Set();
 const THRU_CC=new Set([1,2,4,11,64,120,121,123]);
 function onThru(e){
-  const d=e.data;if(d[0]>=0xF0)return;
+  const d=e.data;if(d[0]>=0xF0){monLog('Keys',d,false);return;}
   const st=d[0]&0xF0;
-  if(st===0xC0||st===0xB0&&!THRU_CC.has(d[1]))return;
+  if(st===0xC0||st===0xB0&&!THRU_CC.has(d[1])){monLog('Keys',d,false);return;}
+  monLog('Keys',d,true);
   const m=Array.from(d);m[0]=st|channel;
   if(st===0x90&&m[2]>0){thruHeld.add(m[1]);markKey(m[1],true);}
   else if(st===0x80||st===0x90){thruHeld.delete(m[1]);if(!held.has(m[1]))markKey(m[1],false);}
@@ -446,7 +477,7 @@ function sendEditBuffer(quiet){if(!out)return quiet||toast('MIDI Out 미선택')
 
 const nrpnState=Array.from({length:16},()=>({pm:0,pl:0,vm:0}));
 function onMIDI(e){
-  const d=e.data;blink('ledIn');
+  const d=e.data;blink('ledIn');monLog('Mopho',d);
   if(d[0]===0xF0)return onSysex(d);
   const st=d[0]&0xF0,ch=d[0]&0x0F;
   if(st===0xB0){const s=nrpnState[ch];
@@ -857,6 +888,7 @@ $('btnSendLib').onclick=async()=>{if(!out)return toast('MIDI Out 미선택');if(
   for(let k=0;k<lib.length;k++){send(progDumpMsg(lib[k].bank,lib[k].pn,lib[k].data));$('libInfo').textContent=`전송 중 ${k+1}/${lib.length}`;await new Promise(r=>setTimeout(r,150));}
   renderLib();toast('Library 전송 완료');};
 $('btnClrLib').onclick=()=>{if(lib.length&&!confirm('Library 목록을 비울까요? (Mopho 메모리는 그대로)'))return;lib=[];libCur=-1;renderLib();};
+$('monClr').onclick=()=>{monLines.length=0;$('mon').innerHTML='';};
 $('btnReqGlobal').onclick=()=>{if(!out)return toast('MIDI Out 미선택');send([0xF0,DSI,MOPHO,0x0E,0xF7]);};
 document.addEventListener('dragover',e=>{e.preventDefault();document.body.classList.add('drop');});
 document.addEventListener('dragleave',e=>{if(!e.relatedTarget)document.body.classList.remove('drop');});
